@@ -10,10 +10,8 @@
 const int TEST_BUTTON_PIN = 4; // Manual ON button
 const int OFF_BUTTON_PIN = 5;  // Manual OFF button
 const int speakerPin = 7;      // Alarm speaker/buzzer
-const int MPU_SDA = 3;         // Data line for MPU-6050
-const int MPU_SCL = 2;         // Clock line for MPU-6050
-const int MATRIX_SDA = 18;    // Data line (SDA) for the 8x8 LED matrix on GPIO 18
-const int MATRIX_SCL = 19;    // Clock line (SCL) for the 8x8 LED matrix on GPIO 19
+const int I2C_SDA = 2;         // Shared I2C data line (MPU-6050 + LED matrix)
+const int I2C_SCL = 3;         // Shared I2C clock line (MPU-6050 + LED matrix)
 
 
 // --- 2. GLOBAL VARIABLES ---
@@ -28,8 +26,8 @@ const int blinkInterval = 400;    // Time in ms between each ON/OFF toggle (matc
 bool matrixState = false;         // Tracks whether the matrix is currently showing (true) or blank (false)
 
 // MAC Addresses of your slaves (Wireless Light Modules)
-uint8_t slave1[] = {0xAC, 0xEB, 0xE6, 0x80, 0xF3, 0xE4};
-uint8_t slave2[] = {0xAC, 0xEB, 0xE6, 0x80, 0x58, 0xC8};
+uint8_t slave1[] = {0xAC, 0xEB, 0xE6, 0x80, 0xF3, 0xE4}; // This is for the blink lights 
+uint8_t slave2[] = {0xAC, 0xEB, 0xE6, 0x80, 0x58, 0xC8}; // If we have another blink module will this be used
 
 // The "Message Envelope" structure
 typedef struct struct_message {
@@ -67,7 +65,6 @@ void drawTriangle() {
 // The "Wobble Detective" - Checks for rapid steering shakes
 bool checkForWobble() {
   sensors_event_t a, g, temp;
-  Wire.begin(MPU_SDA, MPU_SCL);                  // Switch I2C bus to the MPU6050 sensor pins before reading
   mpu.getEvent(&a, &g, &temp); // Get current motion data
 
   Serial.print("Accel_X:"); Serial.print(a.acceleration.x); Serial.print(",");
@@ -79,7 +76,7 @@ bool checkForWobble() {
   static unsigned long lastFlipTime = 0;
 
   // Threshold: If rotation speed is violent (> 3.5 rad/s)
-  if (abs(currentRotation) > 1.5) {
+  if (abs(currentRotation) > 0.5) {
     // Check for direction change (Right-to-Left or Left-to-Right)
     if ((currentRotation > 0 && lastRotation < 0) || (currentRotation < 0 && lastRotation > 0)) {
       flipCount++;
@@ -108,13 +105,13 @@ void setup() {
   pinMode(OFF_BUTTON_PIN, INPUT_PULLUP);
   pinMode(speakerPin, OUTPUT);
 
-  // Start I2C for ESP32-C3
+  // Start shared I2C bus (MPU6050 + LED matrix live on the same bus, different addresses)
   Serial.println("Starting I2C...");
-  Wire.begin(MPU_SDA, MPU_SCL);
+  Wire.begin(I2C_SDA, I2C_SCL);
 
   // Start Motion Sensor
   if (!mpu.begin()) {
-    Serial.println("MPU6050 not found! Check wiring on pins SDA:" + String(MPU_SDA) + " SCL:" + String(MPU_SCL));
+    Serial.println("MPU6050 not found! Check wiring on pins SDA:" + String(I2C_SDA) + " SCL:" + String(I2C_SCL));
     // Don't just continue; if it's not found, the loop will crash later
   } else {
     Serial.println("MPU6050 Ready!");
@@ -123,9 +120,10 @@ void setup() {
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   }
 
-  // Initialize the 8x8 LED Matrix on its own I2C pins
-  Wire.begin(MATRIX_SDA, MATRIX_SCL);            // Re-initialize the I2C bus to talk to the matrix on pins 18 (SDA) and 19 (SCL)
-  if (matrix.begin(0x70)) {                      // Start communication with the matrix at I2C address 0x70 (default for HT16K33)
+  // Initialize the 8x8 LED Matrix on the shared I2C bus (address 0x70)
+  if (!matrix.begin(0x70)) {
+    Serial.println("Matrix not found at 0x70! Check wiring.");
+  } else {
     matrix.setBrightness(5);                     // Set LED brightness level (range 0-15, 5 is moderate)
     matrix.setRotation(1);                       // Rotate the display orientation by 90 degrees if needed to match physical mounting
     matrix.clear();                              // Clear the display buffer so no random LEDs are lit on startup
@@ -173,7 +171,6 @@ void loop() {
         sendSignal(false);
 
         // Turn off the LED matrix when the alarm is deactivated
-        Wire.begin(MATRIX_SDA, MATRIX_SCL);        // Switch I2C bus to the matrix pins
         matrix.clear();                            // Clear the display buffer (all LEDs off)
         matrix.writeDisplay();                     // Push the blank buffer to physically turn off the LEDs
 
@@ -206,7 +203,6 @@ void loop() {
       lastBlinkTime = currentMillis;               // Update the last blink timestamp to "now"
       matrixState = !matrixState;                  // Flip the toggle: if it was ON, make it OFF, and vice versa
 
-      Wire.begin(MATRIX_SDA, MATRIX_SCL);          // Switch the I2C bus to the matrix pins (away from MPU if needed)
       if (matrixState) {
         drawTriangle();                            // ON phase: draw the hazard triangle on the matrix
       } else {
