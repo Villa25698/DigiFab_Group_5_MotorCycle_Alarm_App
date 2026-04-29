@@ -1,0 +1,20 @@
+<!--
+    Merge these keys into ios/Runner/Info.plist after `flutter create .` has
+    generated the iOS scaffolding. (Kept out of the real Info.plist so a
+    `flutter create` regeneration doesn't blow the project away — `flutter
+    create` overwrites Info.plist when it detects it missing.)
+-->
+
+<key>NSBluetoothAlwaysUsageDescription</key>
+<string>MC Alarm needs Bluetooth to talk to the motorcycle gateway.</string>
+
+<key>NSBluetoothPeripheralUsageDescription</key>
+<string>MC Alarm needs Bluetooth to talk to the motorcycle gateway.</string>
+
+<key>NSLocationWhenInUseUsageDescription</key>
+<string>Location is required on mobile OSes before a Bluetooth scan can run.</string>
+
+<key>UIBackgroundModes</key>
+<array>
+    <string>bluetooth-central</string>
+</array>

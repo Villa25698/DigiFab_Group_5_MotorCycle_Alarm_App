@@ -1,0 +1,9 @@
+# Claude Code worktree internals — local to each developer.
+.claude/
+
+# Arduino IDE
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db

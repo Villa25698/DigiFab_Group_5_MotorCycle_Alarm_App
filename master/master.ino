@@ -1,218 +1,446 @@
-#include <esp_now.h>        // Wireless communication library
-#include <WiFi.h>           // WiFi library (required for ESP-NOW)
-#include <Adafruit_MPU6050.h> // Motion sensor library
-#include <Adafruit_Sensor.h>   // Base sensor library
-#include <Wire.h>              // I2C library (for sensor communication)
-#include <Adafruit_GFX.h>         // Graphics library for drawing shapes (lines, circles, etc.) on the LED matrix
-#include "Adafruit_LEDBackpack.h" // Driver library for the HT16K33-based 8x8 LED matrix backpack
+// ============================================================================
+//  MC Alarm — Master (Gateway) firmware
+//  Board: ESP32-C3 DevKitM-1
+//
+//  Roles of this node:
+//    1. Read MPU-6050, detect "death-wobble" event.
+//    2. Drive local siren + hazard-triangle on 8x8 LED matrix.
+//    3. Talk to slave nodes over ESP-NOW  (hazard relay modules).
+//    4. Talk to the phone over BLE GATT   (Flutter MC Alarm app).
+//
+//  BLE GATT layout (custom service):
+//    Service  UUID  a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0001
+//      alarmState   a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0002  READ, NOTIFY   uint8
+//      wobbleEvent  a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0003  NOTIFY         uint8 (counter)
+//      command      a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0004  WRITE          uint8
+//      nodeStatus   a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0005  READ, NOTIFY   uint8 bitmask
+//
+//  command values:
+//    0 = stop alarm          1 = manual trigger       2 = toggle hazard-only
+//
+//  nodeStatus bitmask:
+//    bit 0 = slave1 online   (more bits reserved if you add slaves later)
+// ============================================================================
 
-// --- 1. PIN CONFIGURATION (ESP32-C3 DevKit) ---
-const int TEST_BUTTON_PIN = 4; // Manual ON button
-const int OFF_BUTTON_PIN = 5;  // Manual OFF button
-const int speakerPin = 7;      // Alarm speaker/buzzer
-const int MPU_SDA = 3;         // Data line for MPU-6050
-const int MPU_SCL = 2;         // Clock line for MPU-6050
-const int MATRIX_SDA = 18;    // Data line (SDA) for the 8x8 LED matrix on GPIO 18
-const int MATRIX_SCL = 19;    // Clock line (SCL) for the 8x8 LED matrix on GPIO 19
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include "Adafruit_LEDBackpack.h"
 
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 
-// --- 2. GLOBAL VARIABLES ---
-bool alarmActive = false;      // Current state of the alarm system
-Adafruit_MPU6050 mpu;          // Sensor object
-Adafruit_8x8matrix matrix = Adafruit_8x8matrix(); // Create an object to control the 8x8 LED matrix display
+// --- 1. PIN CONFIGURATION (ESP32-C3 DevKit) -------------------------------
+const int TEST_BUTTON_PIN = 4;
+const int OFF_BUTTON_PIN  = 5;
+const int speakerPin      = 7;
+const int MPU_SDA         = 3;
+const int MPU_SCL         = 2;
+const int MATRIX_SDA      = 18;
+const int MATRIX_SCL      = 19;
 
-// --- Blink timing variables for the LED matrix ---
-// These control the non-blocking blink so the triangle flashes ON and OFF
-unsigned long lastBlinkTime = 0;  // Stores the timestamp (in ms) of the last blink toggle
-const int blinkInterval = 400;    // Time in ms between each ON/OFF toggle (matches the slave ESP blink speed)
-bool matrixState = false;         // Tracks whether the matrix is currently showing (true) or blank (false)
+// --- 2. GLOBAL STATE ------------------------------------------------------
+bool alarmActive = false;
+uint8_t wobbleCounter = 0;            // incremented on each wobble detection (for BLE notify)
 
-// MAC Addresses of your slaves (Wireless Light Modules)
-uint8_t slave1[] = {0xAC, 0xEB, 0xE6, 0x80, 0xF3, 0xE4};
-uint8_t slave2[] = {0xAC, 0xEB, 0xE6, 0x80, 0x58, 0xC8};
+// 5-second arming grace period after a wobble is detected. During this
+// window the rider can press the OFF button (local) or STOP (app) to abort
+// before the siren / matrix / slave relay are fired.
+bool wobblePending = false;
+unsigned long wobblePendingUntil = 0;
+const unsigned long WOBBLE_GRACE_MS = 5000;
 
-// The "Message Envelope" structure
-typedef struct struct_message {
-    bool alarmActive; 
+// After an alarm is silenced (or a pending wobble cancelled), suppress new
+// wobble detection for a short cooldown. The piezo siren physically shakes
+// the gyro, and the bike itself may rock for a moment after the rider hits
+// stop — without this cooldown the alarm immediately re-arms itself.
+unsigned long alarmStoppedAt = 0;
+const unsigned long POST_ALARM_COOLDOWN = 3000;
+
+// Ignore wobble for a moment after boot so the gyro can settle.
+const unsigned long STARTUP_GRACE_MS = 3000;
+
+Adafruit_MPU6050 mpu;
+Adafruit_8x8matrix matrix = Adafruit_8x8matrix();
+
+unsigned long lastBlinkTime = 0;
+const int    blinkInterval = 400;
+bool matrixState = false;
+
+// --- ESP-NOW message protocol --------------------------------------------
+// msgType values
+#define MSG_ALARM_STATE 0x01  // master -> slave : alarmActive
+#define MSG_PING        0x02  // master -> slave : request heartbeat
+#define MSG_HEARTBEAT   0x03  // slave  -> master: I'm alive + my nodeId
+
+typedef struct __attribute__((packed)) struct_message {
+    uint8_t msgType;
+    bool    alarmActive;
+    uint8_t nodeId;          // 0 in master-originated messages, slave's own id in heartbeats
 } struct_message;
 
-struct_message myData;        // Instance of the message
-esp_now_peer_info_t peerInfo; // Slave registration info
+struct_message myData;
+esp_now_peer_info_t peerInfo;
 
-// --- 3. HELPER FUNCTIONS ---
+// Slave MACs
+uint8_t slave1[] = {0xAC, 0xEB, 0xE6, 0x80, 0xF3, 0xE4};
 
-// Function runs when data is sent wirelessly
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("\r\nPacket Status: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivered" : "Failed");
+// Heartbeat bookkeeping
+#define NUM_SLAVES 1
+unsigned long lastHeartbeat[NUM_SLAVES] = {0};
+const unsigned long HEARTBEAT_TIMEOUT = 5000;   // ms without heartbeat => offline
+const unsigned long PING_INTERVAL     = 1500;   // ms between pings
+unsigned long lastPingSent = 0;
+uint8_t lastNodeStatus = 0xFF;                  // force first publish
+
+// --- BLE ------------------------------------------------------------------
+#define SVC_UUID         "a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0001"
+#define CHAR_ALARM_UUID  "a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0002"
+#define CHAR_WOBBLE_UUID "a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0003"
+#define CHAR_CMD_UUID    "a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0004"
+#define CHAR_NODES_UUID  "a8a9b000-7c1f-4d2a-9e6b-2b0f3a7c0005"
+
+BLECharacteristic *chrAlarm  = nullptr;
+BLECharacteristic *chrWobble = nullptr;
+BLECharacteristic *chrCmd    = nullptr;
+BLECharacteristic *chrNodes  = nullptr;
+bool bleClientConnected = false;
+
+// Forward declarations
+void setAlarm(bool on, const char *reason);
+void publishAlarmState();
+void publishNodeStatus(uint8_t mask);
+
+// --- 3. BLE CALLBACKS -----------------------------------------------------
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* srv) override {
+    bleClientConnected = true;
+    Serial.println("BLE: phone connected");
+  }
+  void onDisconnect(BLEServer* srv) override {
+    bleClientConnected = false;
+    Serial.println("BLE: phone disconnected, restarting advertising");
+    BLEDevice::startAdvertising();
+  }
+};
+
+class CmdCallback : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) override {
+    String v = c->getValue();
+    if (v.length() < 1) return;
+    uint8_t cmd = (uint8_t)v[0];
+    Serial.printf("BLE cmd received: %u\n", cmd);
+    switch (cmd) {
+      case 0:
+        // Stop also aborts a pending wobble alarm during its grace period.
+        if (wobblePending) {
+          wobblePending  = false;
+          alarmStoppedAt = millis();
+          Serial.println("Wobble alarm cancelled by app during grace period");
+        }
+        setAlarm(false, "app stop");
+        break;
+      case 1: setAlarm(true,  "app manual");    break;
+      case 2: setAlarm(!alarmActive, "app toggle"); break;
+    }
+  }
+};
+
+// --- 4. ESP-NOW CALLBACKS -------------------------------------------------
+// Signatures match esp32 Arduino core 3.x. Older cores used (uint8_t*, ...).
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  if (status != ESP_NOW_SEND_SUCCESS) Serial.println("ESP-NOW send failed");
 }
 
-// Function to send the ON/OFF signal to all slaves
-void sendSignal(bool state) {
+void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  if (len != sizeof(struct_message)) return;
+  struct_message incoming;
+  memcpy(&incoming, data, sizeof(incoming));
+  if (incoming.msgType == MSG_HEARTBEAT) {
+    uint8_t id = incoming.nodeId;
+    if (id >= 1 && id <= NUM_SLAVES) {
+      lastHeartbeat[id - 1] = millis();
+    }
+  }
+}
+
+// --- 5. HELPERS -----------------------------------------------------------
+void sendAlarmState(bool state) {
+  myData.msgType     = MSG_ALARM_STATE;
   myData.alarmActive = state;
-  esp_now_send(0, (uint8_t *) &myData, sizeof(myData)); // 0 = send to all peers
+  myData.nodeId      = 0;
+  esp_now_send(0, (uint8_t *)&myData, sizeof(myData));
 }
 
-// Draws a hazard warning triangle on the 8x8 LED matrix
-// The triangle is drawn with a 2-pixel-wide top, diagonal sides, and a full bottom base
+void sendPing() {
+  myData.msgType     = MSG_PING;
+  myData.alarmActive = alarmActive;
+  myData.nodeId      = 0;
+  esp_now_send(0, (uint8_t *)&myData, sizeof(myData));
+}
+
+void publishAlarmState() {
+  if (!chrAlarm) return;
+  uint8_t v = alarmActive ? 1 : 0;
+  chrAlarm->setValue(&v, 1);
+  if (bleClientConnected) chrAlarm->notify();
+}
+
+void publishWobble() {
+  if (!chrWobble) return;
+  chrWobble->setValue(&wobbleCounter, 1);
+  if (bleClientConnected) chrWobble->notify();
+}
+
+void publishNodeStatus(uint8_t mask) {
+  if (!chrNodes) return;
+  chrNodes->setValue(&mask, 1);
+  if (bleClientConnected) chrNodes->notify();
+}
+
+// Centralised alarm-state transition so BLE, ESP-NOW, siren and matrix stay in sync.
+void setAlarm(bool on, const char *reason) {
+  if (alarmActive == on) return;
+  alarmActive = on;
+  if (on) {
+    tone(speakerPin, 1200);
+    lastBlinkTime = millis();
+  } else {
+    noTone(speakerPin);
+    digitalWrite(speakerPin, LOW);  // make absolutely sure the pin is silent
+    Wire.begin(MATRIX_SDA, MATRIX_SCL);
+    matrix.clear();
+    matrix.writeDisplay();
+    // Start the post-alarm cooldown so vibration from the speaker / bike
+    // settling doesn't immediately re-trigger the wobble detector.
+    alarmStoppedAt = millis();
+  }
+  sendAlarmState(on);
+  publishAlarmState();
+  Serial.printf("Alarm %s (%s)\n", on ? "ON" : "OFF", reason);
+}
+
 void drawTriangle() {
-  matrix.clear();                                // Clear any previous drawing from the display buffer
-  matrix.drawLine(3, 0, 4, 0, LED_ON);           // Draw top flat edge (2 pixels wide at row 0)
-  matrix.drawLine(3, 0, 0, 7, LED_ON);           // Draw left diagonal side from top-center to bottom-left
-  matrix.drawLine(4, 0, 7, 7, LED_ON);           // Draw right diagonal side from top-center to bottom-right
-  matrix.drawLine(0, 7, 7, 7, LED_ON);           // Draw the bottom base line across the full width
-  matrix.writeDisplay();                         // Push the completed drawing from buffer to the physical LEDs
+  matrix.clear();
+  matrix.drawLine(3, 0, 4, 0, LED_ON);
+  matrix.drawLine(3, 0, 0, 7, LED_ON);
+  matrix.drawLine(4, 0, 7, 7, LED_ON);
+  matrix.drawLine(0, 7, 7, 7, LED_ON);
+  matrix.writeDisplay();
 }
 
-// The "Wobble Detective" - Checks for rapid steering shakes
 bool checkForWobble() {
   sensors_event_t a, g, temp;
-  Wire.begin(MPU_SDA, MPU_SCL);                  // Switch I2C bus to the MPU6050 sensor pins before reading
-  mpu.getEvent(&a, &g, &temp); // Get current motion data
+  Wire.begin(MPU_SDA, MPU_SCL);
+  mpu.getEvent(&a, &g, &temp);
 
-  Serial.print("Accel_X:"); Serial.print(a.acceleration.x); Serial.print(",");
-  Serial.print("Gyro_Z:"); Serial.println(g.gyro.z);
+  // Pick whichever gyro axis is moving the most this sample. That way the
+  // board doesn't have to be mounted in a specific orientation for "shake to
+  // test" to work — twisting around any axis triggers it.
+  float gx = g.gyro.x, gy = g.gyro.y, gz = g.gyro.z;
+  float ax = fabs(gx), ay = fabs(gy), az = fabs(gz);
+  float currentRotation = gz;
+  if (ax >= ay && ax >= az) currentRotation = gx;
+  else if (ay >= ax && ay >= az) currentRotation = gy;
 
-  float currentRotation = g.gyro.z; // Focus on Yaw (steering rotation)
+  const float THRESHOLD = 2.5;        // rad/s — minimum twist speed to count
+                                      // a real handlebar wobble peaks 5–10 rad/s,
+                                      // noise / table bumps stay under ~1 rad/s
+  const int   FLIPS_REQUIRED = 4;     // sign reversals before we trip
+  const unsigned long FLIP_WINDOW = 600; // ms; reset flip count if no flip in this long
+
   static float lastRotation = 0;
-  static int flipCount = 0;
+  static int   flipCount    = 0;
   static unsigned long lastFlipTime = 0;
+  static unsigned long lastDebug    = 0;
+  static unsigned long lastCallTime = 0;
 
-  // Threshold: If rotation speed is violent (> 3.5 rad/s)
-  if (abs(currentRotation) > 1.5) {
-    // Check for direction change (Right-to-Left or Left-to-Right)
+  // If the detector wasn't being polled for a while (e.g. we just exited the
+  // post-alarm cooldown) clear stale state so old flips don't count.
+  unsigned long nowMs = millis();
+  if (lastCallTime != 0 && nowMs - lastCallTime > 500) {
+    lastRotation = 0;
+    flipCount    = 0;
+    lastFlipTime = nowMs;
+  }
+  lastCallTime = nowMs;
+
+  // Both the current AND the previous sample must clear the threshold for a
+  // sign change to count. A single big spike paired with noise no longer
+  // produces a fake flip — only sustained back-and-forth twisting does.
+  if (fabs(currentRotation) > THRESHOLD && fabs(lastRotation) > THRESHOLD) {
     if ((currentRotation > 0 && lastRotation < 0) || (currentRotation < 0 && lastRotation > 0)) {
       flipCount++;
       lastFlipTime = millis();
+      Serial.printf("  flip %d  (rot=%.2f rad/s)\n", flipCount, currentRotation);
     }
   }
-
-  // If no shaking is detected for 400ms, reset the counter
-  if (millis() - lastFlipTime > 400) {
-    flipCount = 0; 
-  }
-
+  if (millis() - lastFlipTime > FLIP_WINDOW) flipCount = 0;
   lastRotation = currentRotation;
 
-  // If we count 4 rapid flips, a death wobble is happening
-  return (flipCount >= 4);
+  // Print live gyro values ~5x/sec so you can see what the sensor sees.
+  if (millis() - lastDebug > 200) {
+    lastDebug = millis();
+    Serial.printf("gyro x=%.2f  y=%.2f  z=%.2f  pick=%.2f  flips=%d\n",
+                  gx, gy, gz, currentRotation, flipCount);
+  }
+
+  return (flipCount >= FLIPS_REQUIRED);
 }
 
-// --- 4. MAIN SETUP (Runs Once) ---
+// --- 6. SETUP -------------------------------------------------------------
 void setup() {
-  Serial.begin(115200);
-  delay(1000); // Give the MPU6050 time to stabilize after power-on
-
-  // Initialize Pins
-  pinMode(TEST_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(OFF_BUTTON_PIN, INPUT_PULLUP);
+  // Silence the speaker as the FIRST thing — before serial init, before any
+  // delay. Until pinMode runs, GPIO 7 floats and the amp / piezo can sing.
   pinMode(speakerPin, OUTPUT);
+  digitalWrite(speakerPin, LOW);
+  noTone(speakerPin);
 
-  // Start I2C for ESP32-C3
-  Serial.println("Starting I2C...");
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(TEST_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(OFF_BUTTON_PIN,  INPUT_PULLUP);
+
   Wire.begin(MPU_SDA, MPU_SCL);
-
-  // Start Motion Sensor
   if (!mpu.begin()) {
-    Serial.println("MPU6050 not found! Check wiring on pins SDA:" + String(MPU_SDA) + " SCL:" + String(MPU_SCL));
-    // Don't just continue; if it's not found, the loop will crash later
+    Serial.println("MPU6050 not found");
   } else {
-    Serial.println("MPU6050 Ready!");
     mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   }
 
-  // Initialize the 8x8 LED Matrix on its own I2C pins
-  Wire.begin(MATRIX_SDA, MATRIX_SCL);            // Re-initialize the I2C bus to talk to the matrix on pins 18 (SDA) and 19 (SCL)
-  if (matrix.begin(0x70)) {                      // Start communication with the matrix at I2C address 0x70 (default for HT16K33)
-    matrix.setBrightness(5);                     // Set LED brightness level (range 0-15, 5 is moderate)
-    matrix.setRotation(1);                       // Rotate the display orientation by 90 degrees if needed to match physical mounting
-    matrix.clear();                              // Clear the display buffer so no random LEDs are lit on startup
-    matrix.writeDisplay();                       // Push the cleared buffer to the matrix so it starts blank
+  Wire.begin(MATRIX_SDA, MATRIX_SCL);
+  if (matrix.begin(0x70)) {
+    matrix.setBrightness(5);
+    matrix.setRotation(1);
+    matrix.clear();
+    matrix.writeDisplay();
   }
 
-  // Start Wireless ESP-NOW
+  // ESP-NOW on STA interface
   WiFi.mode(WIFI_STA);
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW Init Failed");
-    return;
-  }
+  if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW init failed"); }
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
 
-  esp_now_register_send_cb(esp_now_send_cb_t(OnDataSent));
-  
-  // Register Slaves
   memcpy(peerInfo.peer_addr, slave1, 6);
-  peerInfo.channel = 0;  
+  peerInfo.channel = 0;
   peerInfo.encrypt = false;
   esp_now_add_peer(&peerInfo);
 
-  memcpy(peerInfo.peer_addr, slave2, 6);
-  esp_now_add_peer(&peerInfo);
+  // BLE — can coexist with ESP-NOW on C3
+  BLEDevice::init("MC-Alarm");
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new ServerCallbacks());
+  BLEService *svc = server->createService(SVC_UUID);
+
+  chrAlarm = svc->createCharacteristic(CHAR_ALARM_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  chrAlarm->addDescriptor(new BLE2902());
+
+  chrWobble = svc->createCharacteristic(CHAR_WOBBLE_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  chrWobble->addDescriptor(new BLE2902());
+  // Seed with the current counter so phones that read on connect don't see
+  // an undefined / stale value left over in the BLE stack.
+  chrWobble->setValue(&wobbleCounter, 1);
+
+  chrCmd = svc->createCharacteristic(CHAR_CMD_UUID,
+      BLECharacteristic::PROPERTY_WRITE);
+  chrCmd->setCallbacks(new CmdCallback());
+
+  chrNodes = svc->createCharacteristic(CHAR_NODES_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  chrNodes->addDescriptor(new BLE2902());
+
+  svc->start();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SVC_UUID);
+  adv->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE advertising as MC-Alarm");
+
+  publishAlarmState();
+  publishNodeStatus(0);
 }
 
-// --- 5. MAIN LOOP (Runs Continuously) ---
+// --- 7. MAIN LOOP ---------------------------------------------------------
 void loop() {
-  // Check for Manual ON button
+  // Manual ON
   if (digitalRead(TEST_BUTTON_PIN) == LOW) {
-    if (!alarmActive) {
-        alarmActive = true;
-        tone(speakerPin, 1000); // Siren sound
-        sendSignal(true);
-        lastBlinkTime = millis();                  // Sync the matrix blink timer to start immediately
-        Serial.println("Alarm Activated Manually");
-    }
+    setAlarm(true, "local button");
     delay(250);
   }
-
-  // Check for Manual OFF button
+  // Manual OFF — also aborts a pending wobble alarm during its grace period.
   if (digitalRead(OFF_BUTTON_PIN) == LOW) {
-    if (alarmActive) {
-        alarmActive = false;
-        noTone(speakerPin); // Silence sound
-        sendSignal(false);
-
-        // Turn off the LED matrix when the alarm is deactivated
-        Wire.begin(MATRIX_SDA, MATRIX_SCL);        // Switch I2C bus to the matrix pins
-        matrix.clear();                            // Clear the display buffer (all LEDs off)
-        matrix.writeDisplay();                     // Push the blank buffer to physically turn off the LEDs
-
-        Serial.println("Alarm Deactivated");
+    if (wobblePending) {
+      wobblePending  = false;
+      alarmStoppedAt = millis();
+      Serial.println("Wobble alarm cancelled by OFF button during grace period");
     }
+    setAlarm(false, "local button");
     delay(250);
   }
 
-  // Check for Automatic Wobble Detection
-  if (!alarmActive) {
+  // Wobble detection — gated on:
+  //   1. alarm not currently firing
+  //   2. no pending grace period already running
+  //   3. we're past the post-alarm cooldown (gyro has settled)
+  //   4. we're past the startup grace (gyro has finished warming up)
+  bool wobbleAllowed = !alarmActive
+                    && !wobblePending
+                    && millis() > STARTUP_GRACE_MS
+                    && (alarmStoppedAt == 0
+                        || (millis() - alarmStoppedAt) > POST_ALARM_COOLDOWN);
+  if (wobbleAllowed) {
     if (checkForWobble()) {
-      alarmActive = true;
-      tone(speakerPin, 1300); // Higher pitch siren
-      sendSignal(true);
-      lastBlinkTime = millis();                    // Sync the matrix blink timer when wobble triggers alarm
-      Serial.println("WOBBLE DETECTED - ALARM ACTIVE");
+      wobbleCounter++;
+      publishWobble();              // tell phone NOW so emergency screen pops
+      wobblePending      = true;
+      wobblePendingUntil = millis() + WOBBLE_GRACE_MS;
+      Serial.printf("Wobble detected — arming in %lu ms\n", WOBBLE_GRACE_MS);
     }
   }
 
-  // --- LED Matrix Blinking Logic (Non-Blocking) ---
-  // This section only runs while the alarm is active.
-  // It uses millis() instead of delay() so it doesn't block the rest of the loop
-  // (buttons and wobble detection keep working during the blink animation).
-  // The blink interval (400ms) matches the slave ESP blink speed so they flash in sync.
+  // If grace period elapsed without cancellation, fire the alarm.
+  if (wobblePending && (long)(millis() - wobblePendingUntil) >= 0) {
+    wobblePending = false;
+    setAlarm(true, "wobble (after grace)");
+  }
+
+  // Heartbeat / node-status maintenance
+  unsigned long now = millis();
+  if (now - lastPingSent >= PING_INTERVAL) {
+    lastPingSent = now;
+    sendPing();
+  }
+  uint8_t mask = 0;
+  for (int i = 0; i < NUM_SLAVES; ++i) {
+    if (lastHeartbeat[i] != 0 && (now - lastHeartbeat[i]) < HEARTBEAT_TIMEOUT) {
+      mask |= (1 << i);
+    }
+  }
+  if (mask != lastNodeStatus) {
+    lastNodeStatus = mask;
+    publishNodeStatus(mask);
+    Serial.printf("Node status: 0x%02X\n", mask);
+  }
+
+  // LED matrix blink while alarm is active
   if (alarmActive) {
-    unsigned long currentMillis = millis();        // Capture the current time once for consistency
-
-    // Check if enough time has passed since the last blink toggle
-    if (currentMillis - lastBlinkTime >= blinkInterval) {
-      lastBlinkTime = currentMillis;               // Update the last blink timestamp to "now"
-      matrixState = !matrixState;                  // Flip the toggle: if it was ON, make it OFF, and vice versa
-
-      Wire.begin(MATRIX_SDA, MATRIX_SCL);          // Switch the I2C bus to the matrix pins (away from MPU if needed)
-      if (matrixState) {
-        drawTriangle();                            // ON phase: draw the hazard triangle on the matrix
-      } else {
-        matrix.clear();                            // OFF phase: clear the display buffer
-        matrix.writeDisplay();                     // Push the blank buffer to turn off all LEDs
-      }
+    if (now - lastBlinkTime >= (unsigned long)blinkInterval) {
+      lastBlinkTime = now;
+      matrixState = !matrixState;
+      Wire.begin(MATRIX_SDA, MATRIX_SCL);
+      if (matrixState) drawTriangle();
+      else { matrix.clear(); matrix.writeDisplay(); }
     }
   }
 }
