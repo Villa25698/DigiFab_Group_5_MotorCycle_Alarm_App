@@ -1,23 +1,44 @@
+// =============================================================================
+// MC Alarm — Dashboard (the home screen while connected)
+// =============================================================================
+//
+// What the rider sees while everything is fine. Deliberately spartan:
+//   - one big status card (link / all online / alarm active)
+//   - one chip showing whether the hazard relay slave is online
+//   - HAZARDS button (with confirmation dialog when activating)
+//   - STOP ALARM button (only enabled when alarm is on)
+//   - logout (disconnect) icon in the app bar
+//
+// Big touch targets, high contrast, no fiddly menus — the rider is
+// glancing at a handlebar-mounted phone, possibly with gloves on.
+// =============================================================================
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../bluetooth/ble_service.dart';
 import '../theme/app_theme.dart';
 
-/// Ride-time home screen. Deliberately sparse — one status block and two
-/// oversized action buttons. Anything more becomes noise to a rider glancing
-/// at a handlebar-mounted phone.
 class DashboardScreen extends StatelessWidget {
   const DashboardScreen({super.key});
 
+  /// Handle a press on the HAZARDS button.
+  ///
+  /// If the alarm is currently OFF, show a confirmation dialog asking
+  /// "Test alarm? YES / NO" before firing. This stops accidental presses
+  /// from triggering the siren in public.
+  ///
+  /// If the alarm is currently ON, the button doubles as a "turn off"
+  /// shortcut — no confirmation needed.
   Future<void> _onHazardPressed(BuildContext context) async {
     final ble = context.read<BleService>();
-    // Turning the alarm off via the HAZARDS button doesn't need a confirmation
-    // — only ask before activating.
+
     if (ble.alarmActive) {
+      // Already on — just toggle off, no dialog.
       await ble.toggleHazard();
       return;
     }
+
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -38,6 +59,7 @@ class DashboardScreen extends StatelessWidget {
         ],
       ),
     );
+
     if (confirmed == true) {
       await ble.toggleHazard();
     }
@@ -45,6 +67,8 @@ class DashboardScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // watch() rebuilds this screen whenever BleService.notifyListeners()
+    // fires — i.e. when alarm state, node status, or connection state changes.
     final ble = context.watch<BleService>();
     final online1 = ble.isNodeOnline(1);
 
@@ -66,19 +90,23 @@ class DashboardScreen extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               _StatusCard(
-                connected: true,
-                alarmActive: ble.alarmActive,
+                connected:     true,
+                alarmActive:   ble.alarmActive,
                 anyNodeOnline: online1,
               ),
               const SizedBox(height: 16),
               _NodeChip(id: 1, online: online1),
               const Spacer(),
+
+              // HAZARDS button — confirmation required to turn ON.
               ElevatedButton.icon(
                 onPressed: () => _onHazardPressed(context),
                 icon: const Icon(Icons.warning_amber_rounded, size: 32),
                 label: Text(ble.alarmActive ? 'HAZARDS ON' : 'HAZARDS'),
               ),
               const SizedBox(height: 16),
+
+              // STOP button — disabled (greyed) when there's nothing to stop.
               ElevatedButton.icon(
                 onPressed: ble.alarmActive ? ble.stopAlarm : null,
                 style: ElevatedButton.styleFrom(
@@ -99,6 +127,10 @@ class DashboardScreen extends StatelessWidget {
   }
 }
 
+/// The big top status card. Three colour states:
+///   red     — alarm is firing
+///   green   — gateway + at least one slave online (normal armed state)
+///   yellow  — gateway only (slave isn't responding to pings)
 class _StatusCard extends StatelessWidget {
   final bool connected;
   final bool alarmActive;
@@ -111,11 +143,12 @@ class _StatusCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Dart 3 record destructuring — cute but compact.
     final (color, label, icon) = alarmActive
-        ? (AppTheme.danger, 'ALARM ACTIVE', Icons.notifications_active)
+        ? (AppTheme.danger,  'ALARM ACTIVE',       Icons.notifications_active)
         : anyNodeOnline
             ? (AppTheme.success, 'ALL SYSTEMS ONLINE', Icons.verified)
-            : (AppTheme.primary, 'GATEWAY ONLY', Icons.link);
+            : (AppTheme.primary, 'GATEWAY ONLY',       Icons.link);
 
     return Container(
       padding: const EdgeInsets.all(20),
@@ -140,6 +173,8 @@ class _StatusCard extends StatelessWidget {
   }
 }
 
+/// One row showing a slave's online status. Green dot + "ON" when online,
+/// grey + "OFF" otherwise.
 class _NodeChip extends StatelessWidget {
   final int id;
   final bool online;
@@ -164,7 +199,8 @@ class _NodeChip extends StatelessWidget {
         ),
         const SizedBox(width: 10),
         Text('Hazard relay (Node $id)',
-            style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600)),
+            style: const TextStyle(
+                fontSize: 18, fontWeight: FontWeight.w600)),
         const Spacer(),
         Text(online ? 'ON' : 'OFF',
             style: TextStyle(

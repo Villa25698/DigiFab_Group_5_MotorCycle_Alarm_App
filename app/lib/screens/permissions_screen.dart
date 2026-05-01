@@ -1,3 +1,22 @@
+// =============================================================================
+// MC Alarm — Permissions screen
+// =============================================================================
+//
+// Asks the OS for the permissions BLE needs:
+//   - Bluetooth Scan + Connect (required)
+//   - Location When In Use     (Android 11 and below need this for BLE scans)
+//   - Notifications            (nice-to-have, used for the wobble alert)
+//
+// We do NOT block on GPS being switched on. Our AndroidManifest sets
+// android:usesPermissionFlags="neverForLocation" on BLUETOOTH_SCAN, which
+// tells Android 12+ that we are not using BLE to derive location, so it does
+// not require the user to turn on the Location services switch.
+//
+// Once Bluetooth + Location are granted (Notifications is optional), we
+// pushReplacement to ScanScreen so the back button doesn't bring the user
+// back here.
+// =============================================================================
+
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -7,9 +26,6 @@ import 'package:permission_handler/permission_handler.dart';
 import '../theme/app_theme.dart';
 import 'scan_screen.dart';
 
-/// Asks the OS for the permissions BLE needs. We do not block on GPS being
-/// switched on — the manifest sets neverForLocation on BLUETOOTH_SCAN, so
-/// Android 12+ does not require Location services for our scans.
 class PermissionsScreen extends StatefulWidget {
   const PermissionsScreen({super.key});
 
@@ -18,15 +34,30 @@ class PermissionsScreen extends StatefulWidget {
 }
 
 class _PermissionsScreenState extends State<PermissionsScreen> {
-  bool _btGranted = false;
-  bool _locGranted = false;
+  // Per-permission "is granted?" flags drive the green check / grey circle
+  // indicators in the UI.
+  bool _btGranted    = false;
+  bool _locGranted   = false;
   bool _notifGranted = false;
+
+  /// True while a permission request is in flight — we disable the button
+  /// so the user can't double-tap.
   bool _working = false;
+
+  /// Status line shown above the button.
   String _status = 'Tap the button to grant permissions.';
 
+  /// Request all the permissions the BLE stack needs, then either advance
+  /// to ScanScreen or show an error / open Settings.
   Future<void> _runChecks() async {
-    setState(() { _working = true; _status = 'Requesting permissions…'; });
+    setState(() {
+      _working = true;
+      _status = 'Requesting permissions…';
+    });
     try {
+      // Different permissions list per platform. iOS doesn't have the
+      // split bluetoothScan / bluetoothConnect — it has a single
+      // Bluetooth permission.
       final perms = Platform.isAndroid
           ? <Permission>[
               Permission.bluetoothScan,
@@ -40,21 +71,27 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
               Permission.notification,
             ];
 
+      // permission_handler request() shows the system dialog for any perm
+      // that's currently undetermined. Already-granted perms are skipped.
       final results = await perms.request();
       results.forEach((p, s) => debugPrint('perm $p -> $s'));
 
+      // "limited" is iOS-only and counts as granted for our purposes.
       bool isOk(Permission p) {
         final s = results[p];
-        return s == PermissionStatus.granted || s == PermissionStatus.limited;
+        return s == PermissionStatus.granted ||
+               s == PermissionStatus.limited;
       }
 
       _btGranted = Platform.isAndroid
-          ? (isOk(Permission.bluetoothScan) && isOk(Permission.bluetoothConnect))
+          ? (isOk(Permission.bluetoothScan) &&
+             isOk(Permission.bluetoothConnect))
           : isOk(Permission.bluetooth);
-      _locGranted = isOk(Permission.locationWhenInUse);
+      _locGranted   = isOk(Permission.locationWhenInUse);
       _notifGranted = isOk(Permission.notification);
 
-      // Anything permanently denied — open settings so the user can flip it.
+      // "Permanently denied" means the user tapped "Don't ask again". The
+      // only way to recover is the system Settings app.
       final permanentlyDenied = results.values
           .any((s) => s == PermissionStatus.permanentlyDenied);
 
@@ -71,7 +108,8 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
         return;
       }
 
-      // Both critical perms granted — proceed even if notifications was declined.
+      // BT + Location are both OK. We tolerate notifications being denied
+      // (the rider just won't get the background-app wobble alert).
       if (mounted) {
         Navigator.of(context).pushReplacement(
             MaterialPageRoute(builder: (_) => const ScanScreen()));
@@ -80,6 +118,8 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
       debugPrint('permissions error: $e\n$st');
       setState(() => _status = 'Permissions check failed: $e');
     } finally {
+      // mounted check guards against the user backing out during the
+      // request — setState on an unmounted widget throws.
       if (mounted) setState(() => _working = false);
     }
   }
@@ -102,15 +142,16 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
                 style: TextStyle(fontSize: 18, color: AppTheme.textSub),
               ),
               const SizedBox(height: 24),
-              _Row(label: 'Bluetooth', ok: _btGranted),
+              _Row(label: 'Bluetooth',     ok: _btGranted),
               const SizedBox(height: 10),
-              _Row(label: 'Location', ok: _locGranted),
+              _Row(label: 'Location',      ok: _locGranted),
               const SizedBox(height: 10),
               _Row(label: 'Notifications', ok: _notifGranted),
               const Spacer(),
               Text(_status,
                   textAlign: TextAlign.center,
-                  style: const TextStyle(fontSize: 16, color: AppTheme.textSub)),
+                  style: const TextStyle(
+                      fontSize: 16, color: AppTheme.textSub)),
               const SizedBox(height: 16),
               ElevatedButton(
                 onPressed: _working ? null : _runChecks,
@@ -125,6 +166,7 @@ class _PermissionsScreenState extends State<PermissionsScreen> {
   }
 }
 
+/// One row in the permissions checklist. Green check or grey circle.
 class _Row extends StatelessWidget {
   final String label;
   final bool ok;

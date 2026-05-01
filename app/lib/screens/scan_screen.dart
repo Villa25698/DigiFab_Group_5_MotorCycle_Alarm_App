@@ -1,12 +1,25 @@
+// =============================================================================
+// MC Alarm — Scan & connect screen
+// =============================================================================
+//
+// Scans for the master ("MC-Alarm") and connects to the first match.
+// There is no device picker because there's only ever one gateway in the
+// rider's setup, so a list would just add a tap.
+//
+// Flow:
+//   1. initState fires _startScan after the first frame.
+//   2. _startScan asks BleService to scan; on success, asks it to connect.
+//   3. On successful connect, pop everything off the navigator stack so the
+//      root router (in main.dart) renders the dashboard underneath.
+//   4. On failure, show a "Try again" button.
+// =============================================================================
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../bluetooth/ble_service.dart';
 import '../theme/app_theme.dart';
 
-/// Scans for the MC-Alarm gateway and connects automatically.
-/// No device picker — there's only one gateway, so we match the service UUID
-/// and snap to the first hit.
 class ScanScreen extends StatefulWidget {
   const ScanScreen({super.key});
 
@@ -21,27 +34,45 @@ class _ScanScreenState extends State<ScanScreen> {
   @override
   void initState() {
     super.initState();
+    // Can't context.read() inside initState directly. Defer to next frame.
     WidgetsBinding.instance.addPostFrameCallback((_) => _startScan());
   }
 
   Future<void> _startScan() async {
-    setState(() { _status = 'Searching for MC-Alarm…'; _failed = false; });
+    setState(() {
+      _status = 'Searching for MC-Alarm…';
+      _failed = false;
+    });
     final ble = context.read<BleService>();
+
+    // STEP 1 — scan
     final device = await ble.scanForGateway();
-    if (!mounted) return;
+    if (!mounted) return;     // user might have backed out during the scan
     if (device == null) {
-      setState(() { _status = 'Could not find the gateway.'; _failed = true; });
+      setState(() {
+        _status = 'Could not find the gateway.';
+        _failed = true;
+      });
       return;
     }
+
+    // STEP 2 — connect
     setState(() => _status = 'Connecting…');
     final ok = await ble.connect(device);
     if (!mounted) return;
     if (!ok) {
-      setState(() { _status = 'Connection failed.'; _failed = true; });
+      setState(() {
+        _status = 'Connection failed.';
+        _failed = true;
+      });
       return;
     }
-    // Connected — clear the welcome/permissions/scan stack so the root
-    // router can render the dashboard underneath.
+
+    // STEP 3 — clean up the navigator stack.
+    // We pushed PermissionsScreen then ScanScreen on top of WelcomeScreen.
+    // Now that we're connected, the root router will render DashboardScreen
+    // underneath, but only if we pop those overlays off. popUntil(isFirst)
+    // wipes everything back to the root.
     Navigator.of(context).popUntil((route) => route.isFirst);
   }
 
@@ -56,11 +87,13 @@ class _ScanScreenState extends State<ScanScreen> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               const Spacer(),
+              // Spinner while we're working; error icon if we gave up.
               if (!_failed)
                 const CircularProgressIndicator(
                     color: AppTheme.primary, strokeWidth: 6),
               if (_failed)
-                const Icon(Icons.error_outline, size: 96, color: AppTheme.danger),
+                const Icon(Icons.error_outline,
+                    size: 96, color: AppTheme.danger),
               const SizedBox(height: 28),
               Text(_status,
                   textAlign: TextAlign.center,

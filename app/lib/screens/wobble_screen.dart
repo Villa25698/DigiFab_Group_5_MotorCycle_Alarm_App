@@ -1,3 +1,32 @@
+// =============================================================================
+// MC Alarm — Wobble emergency takeover screen
+// =============================================================================
+//
+// Pushed full-screen by main.dart's _RootRouter the moment a wobble event
+// arrives over BLE. Whatever screen the rider was on (dashboard, dialog,
+// even another app on Android with full-screen-intent) gets covered by this.
+//
+// Two controls only:
+//   - HAZARD LIGHTS  (toggle — already on by default if past grace)
+//   - STOP           (silences everything and pops back to the dashboard)
+//
+// Why so minimal?
+//   The rider is potentially mid-incident. Anything more than two huge,
+//   unmistakable buttons would be dangerous noise.
+//
+// Countdown logic:
+//   When the master sends the wobble notify, it has NOT yet fired the siren —
+//   it's in a 5-second arming grace period. The rider can press STOP within
+//   those 5 seconds to abort. We mirror that countdown here so the rider can
+//   see how long they have. After:
+//     - 5 seconds elapse                  → grace consumed (alarm fires)
+//     - alarmActive flips to true         → grace consumed
+//     - STOP pressed                      → grace consumed
+//   …the countdown is gone forever for this screen instance. (Otherwise
+//   pressing STOP would weirdly bring the countdown back into view because
+//   alarmActive becomes false again.)
+// =============================================================================
+
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -7,14 +36,6 @@ import 'package:provider/provider.dart';
 import '../bluetooth/ble_service.dart';
 import '../theme/app_theme.dart';
 
-/// Full-screen emergency takeover shown when the gateway notifies us of a
-/// wobble. Two controls only: toggle hazards (already on by default) and
-/// STOP. Everything else is kept out of reach because the rider is
-/// potentially mid-incident.
-///
-/// On notify the master is in a 5-second arming grace period — siren and
-/// hazards have NOT fired yet. We mirror that countdown here so the rider
-/// can see how much time they have to press STOP and abort.
 class WobbleScreen extends StatefulWidget {
   const WobbleScreen({super.key});
   @override
@@ -23,20 +44,26 @@ class WobbleScreen extends StatefulWidget {
 
 class _WobbleScreenState extends State<WobbleScreen>
     with SingleTickerProviderStateMixin {
+  /// Length of the master's grace period in seconds — must match
+  /// WOBBLE_GRACE_MS in master.ino (5000ms).
   static const int _graceSeconds = 5;
 
+  /// Drives the pulsing animation of the warning icon.
   late final AnimationController _pulse = AnimationController(
       vsync: this, duration: const Duration(milliseconds: 600))
     ..repeat(reverse: true);
 
+  /// Per-second timer that decrements [_secondsLeft]. Cancelled when grace
+  /// is consumed (so it doesn't keep firing in the background).
   Timer? _ticker;
   int _secondsLeft = _graceSeconds;
-  // True once we've left the pre-arm grace period — either because the timer
-  // ran out, the master fired the alarm, or the rider pressed STOP. Once this
-  // flips true it never goes back; the countdown is for the FIRST 5 seconds
-  // of the screen and never again.
+
+  /// True once we've left the pre-arm grace period for ANY reason. Once
+  /// flipped true it never goes back. This guarantees the countdown stops
+  /// for good and doesn't reappear if the user toggles things.
   bool _graceConsumed = false;
 
+  /// Mark the grace period as over. Idempotent.
   void _endGrace() {
     if (_graceConsumed) return;
     _graceConsumed = true;
@@ -47,7 +74,10 @@ class _WobbleScreenState extends State<WobbleScreen>
   @override
   void initState() {
     super.initState();
+    // Strong haptic so the rider feels the alert even if the phone is
+    // muted / in a glove pocket.
     HapticFeedback.heavyImpact();
+
     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
       setState(() {
@@ -69,18 +99,22 @@ class _WobbleScreenState extends State<WobbleScreen>
   @override
   Widget build(BuildContext context) {
     final ble = context.watch<BleService>();
-    // The moment the master flips alarmActive -> true, the grace window is
-    // over. (The phone notify and the alarmState notify can land in either
-    // order, so check on every rebuild.)
+
+    // The wobble notify and the alarmActive notify can arrive in either
+    // order over BLE. If alarmActive becomes true while we're still in
+    // grace, that means the master fired the siren — end the grace.
+    // Schedule via post-frame to avoid setState during build.
     if (ble.alarmActive && !_graceConsumed) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) setState(_endGrace);
       });
     }
+
     final inGrace = !_graceConsumed && _secondsLeft > 0 && !ble.alarmActive;
 
     return PopScope(
-      canPop: false, // rider can't back-out accidentally
+      // Block the system back gesture / button. The rider has to use STOP.
+      canPop: false,
       child: Scaffold(
         backgroundColor: Colors.black,
         body: SafeArea(
@@ -90,6 +124,7 @@ class _WobbleScreenState extends State<WobbleScreen>
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 const SizedBox(height: 8),
+                // Pulsing warning icon — grabs attention.
                 FadeTransition(
                   opacity: _pulse,
                   child: const Icon(Icons.warning_amber_rounded,
@@ -105,6 +140,9 @@ class _WobbleScreenState extends State<WobbleScreen>
                       letterSpacing: 2,
                     )),
                 const SizedBox(height: 12),
+
+                // While in grace: show countdown + "press STOP to cancel"
+                // After grace: show "Hazards on — slow down safely"
                 if (inGrace)
                   Column(children: [
                     Text('ALARM IN $_secondsLeft',
@@ -124,8 +162,13 @@ class _WobbleScreenState extends State<WobbleScreen>
                 else
                   const Text('Hazards on — slow down safely',
                       textAlign: TextAlign.center,
-                      style: TextStyle(fontSize: 20, color: AppTheme.textSub)),
+                      style: TextStyle(
+                          fontSize: 20, color: AppTheme.textSub)),
+
                 const Spacer(),
+
+                // Hazard lights toggle. Useful if the rider survives the
+                // wobble and wants to leave hazards on / off.
                 ElevatedButton.icon(
                   onPressed: ble.toggleHazard,
                   style: ElevatedButton.styleFrom(
@@ -139,10 +182,14 @@ class _WobbleScreenState extends State<WobbleScreen>
                           fontSize: 22, fontWeight: FontWeight.w800)),
                 ),
                 const SizedBox(height: 16),
+
+                // STOP — the most important button on this screen.
+                // Oversized on purpose. Sends cmd 0 to the master, which
+                // also aborts a pending wobble during its grace period.
                 ElevatedButton(
                   onPressed: () async {
-                    _endGrace();
-                    await ble.stopAlarm();
+                    _endGrace();                // hide countdown immediately
+                    await ble.stopAlarm();      // cmd 0 -> master
                     if (context.mounted) Navigator.of(context).pop();
                   },
                   style: ElevatedButton.styleFrom(

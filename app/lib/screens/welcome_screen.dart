@@ -1,3 +1,16 @@
+// =============================================================================
+// MC Alarm — Welcome screen
+// =============================================================================
+//
+// First screen the rider sees when the app launches and there is no BLE
+// connection yet. Single big icon, the app name, and a START button that
+// pushes the permissions screen.
+//
+// No state, no logic — pure presentation. The decision "show this or the
+// dashboard?" is made in main.dart's _RootRouter, which swaps based on
+// BleService.state.
+// =============================================================================
+
 import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
@@ -15,6 +28,8 @@ class WelcomeScreen extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              // Spacers around the content centre it vertically while keeping
+              // the START button comfortably reachable at the bottom.
               const Spacer(),
               const Icon(Icons.warning_amber_rounded,
                   size: 120, color: AppTheme.primary),
@@ -33,6 +48,9 @@ class WelcomeScreen extends StatelessWidget {
               const Spacer(),
               ElevatedButton(
                 onPressed: () {
+                  // Push (not pushReplacement) so the user can back out if
+                  // they want. PermissionsScreen will pushReplacement to the
+                  // ScanScreen once perms are granted.
                   Navigator.of(context).push(MaterialPageRoute(
                       builder: (_) => const PermissionsScreen()));
                 },
