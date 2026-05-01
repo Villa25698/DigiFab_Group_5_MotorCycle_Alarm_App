@@ -39,14 +39,15 @@
 const int TEST_BUTTON_PIN = 4;
 const int OFF_BUTTON_PIN  = 5;
 const int speakerPin      = 7;
-const int MPU_SDA         = 3;
-const int MPU_SCL         = 2;
-const int MATRIX_SDA      = 18;
-const int MATRIX_SCL      = 19;
+// MPU-6050 (addr 0x68) and LED matrix (addr 0x70) share the SAME I2C bus.
+// Two devices, one bus, different addresses — that's how I2C works.
+const int I2C_SDA         = 2;
+const int I2C_SCL         = 3;
 
 // --- 2. GLOBAL STATE ------------------------------------------------------
 bool alarmActive = false;
 uint8_t wobbleCounter = 0;            // incremented on each wobble detection (for BLE notify)
+bool mpuOk = false;                   // set true only if MPU6050 was found at boot
 
 // 5-second arming grace period after a wobble is detected. During this
 // window the rider can press the OFF button (local) or STOP (app) to abort
@@ -208,12 +209,11 @@ void setAlarm(bool on, const char *reason) {
   if (alarmActive == on) return;
   alarmActive = on;
   if (on) {
-    tone(speakerPin, 1200);
+    tone(speakerPin, 100);
     lastBlinkTime = millis();
   } else {
     noTone(speakerPin);
     digitalWrite(speakerPin, LOW);  // make absolutely sure the pin is silent
-    Wire.begin(MATRIX_SDA, MATRIX_SCL);
     matrix.clear();
     matrix.writeDisplay();
     // Start the post-alarm cooldown so vibration from the speaker / bike
@@ -236,7 +236,6 @@ void drawTriangle() {
 
 bool checkForWobble() {
   sensors_event_t a, g, temp;
-  Wire.begin(MPU_SDA, MPU_SCL);
   mpu.getEvent(&a, &g, &temp);
 
   // Pick whichever gyro axis is moving the most this sample. That way the
@@ -248,11 +247,11 @@ bool checkForWobble() {
   if (ax >= ay && ax >= az) currentRotation = gx;
   else if (ay >= ax && ay >= az) currentRotation = gy;
 
-  const float THRESHOLD = 2.5;        // rad/s — minimum twist speed to count
-                                      // a real handlebar wobble peaks 5–10 rad/s,
-                                      // noise / table bumps stay under ~1 rad/s
-  const int   FLIPS_REQUIRED = 4;     // sign reversals before we trip
-  const unsigned long FLIP_WINDOW = 600; // ms; reset flip count if no flip in this long
+  // ---- DEMO TUNING (easier to trigger by hand) ----
+  // For real bike use, raise THRESHOLD back to 2.5 and FLIPS_REQUIRED to 4.
+  const float THRESHOLD = 1.0;        // rad/s — minimum twist speed to count
+  const int   FLIPS_REQUIRED = 3;     // sign reversals before we trip
+  const unsigned long FLIP_WINDOW = 800; // ms; reset flip count if no flip in this long
 
   static float lastRotation = 0;
   static int   flipCount    = 0;
@@ -269,6 +268,15 @@ bool checkForWobble() {
     lastFlipTime = nowMs;
   }
   lastCallTime = nowMs;
+
+  // Sanity floor: the gyro is set to ±500°/s = ±8.73 rad/s full-scale.
+  // Any reading larger than that is impossible and means the sensor returned
+  // garbage (disconnected wire, dead chip, I2C glitch). Drop those samples.
+  const float SANITY_MAX = 9.0;
+  if (fabs(currentRotation) > SANITY_MAX) {
+    lastRotation = 0;
+    return false;
+  }
 
   // Both the current AND the previous sample must clear the threshold for a
   // sign change to count. A single big spike paired with noise no longer
@@ -307,21 +315,30 @@ void setup() {
   pinMode(TEST_BUTTON_PIN, INPUT_PULLUP);
   pinMode(OFF_BUTTON_PIN,  INPUT_PULLUP);
 
-  Wire.begin(MPU_SDA, MPU_SCL);
+  // Shared I2C bus for both MPU-6050 (0x68) and the LED matrix (0x70).
+  Serial.println("Starting I2C...");
+  Wire.begin(I2C_SDA, I2C_SCL);
+
   if (!mpu.begin()) {
-    Serial.println("MPU6050 not found");
+    Serial.printf("MPU6050 not found on SDA=%d SCL=%d — wobble detection DISABLED\n",
+                  I2C_SDA, I2C_SCL);
+    mpuOk = false;
   } else {
     mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
     mpu.setGyroRange(MPU6050_RANGE_500_DEG);
     mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+    mpuOk = true;
+    Serial.println("MPU6050 ready");
   }
 
-  Wire.begin(MATRIX_SDA, MATRIX_SCL);
   if (matrix.begin(0x70)) {
     matrix.setBrightness(5);
     matrix.setRotation(1);
     matrix.clear();
     matrix.writeDisplay();
+    Serial.println("LED matrix ready");
+  } else {
+    Serial.println("LED matrix not found at 0x70 — display disabled");
   }
 
   // ESP-NOW on STA interface
@@ -390,11 +407,13 @@ void loop() {
   }
 
   // Wobble detection — gated on:
-  //   1. alarm not currently firing
-  //   2. no pending grace period already running
-  //   3. we're past the post-alarm cooldown (gyro has settled)
-  //   4. we're past the startup grace (gyro has finished warming up)
-  bool wobbleAllowed = !alarmActive
+  //   1. MPU was actually found at boot (no garbage-data false triggers)
+  //   2. alarm not currently firing
+  //   3. no pending grace period already running
+  //   4. we're past the post-alarm cooldown (gyro has settled)
+  //   5. we're past the startup grace (gyro has finished warming up)
+  bool wobbleAllowed = mpuOk
+                    && !alarmActive
                     && !wobblePending
                     && millis() > STARTUP_GRACE_MS
                     && (alarmStoppedAt == 0
@@ -438,7 +457,6 @@ void loop() {
     if (now - lastBlinkTime >= (unsigned long)blinkInterval) {
       lastBlinkTime = now;
       matrixState = !matrixState;
-      Wire.begin(MATRIX_SDA, MATRIX_SCL);
       if (matrixState) drawTriangle();
       else { matrix.clear(); matrix.writeDisplay(); }
     }
