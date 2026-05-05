@@ -130,6 +130,22 @@ surface vibration and engine harmonics don't cause false triggers. The
 constants are at the top of `checkForWobble()` in
 [`master/master.ino`](master/master.ino).
 
+## Demo Guide
+Follow these steps to power on the system and simulate motorcycle death wobble event
+
+1. Powering on
+   * Open the enclousures: Carefully open the lids of both the master(handlebar module) and the slave(light relay module)(CAUTION! Handle the Slave module (Lower box) carefullt when open, as interal components may be loose)
+   * Acticate Power: Locate the battery switches and toggle them on.
+   * Once the LEDs on the esp32 boards indicate power, screw the lids back on
+   * Connect the 12v battery to a outlet
+2. Simulating the death wobble
+   * Place both hand on the handlebar grips
+   * Mimic a motorcycle death wobble by making rapid left and right steering motions
+   * You will have to do back and fourth motions until the LED Matric will display a hazard triangle. (It will also display on your phone if app us being used)
+3. Managing the alarm
+   * When the the alarm is triggered will you have a 5 second grace period to turn it off before the alarm starts. Press the Stop button on top of the master module or Stop button on your phone to turn prevent the siren and hazard light from activating
+   * When the countdown reaches zero, will there be an aduble sound, matrix will keep blinking, and the hazard lights will start blinking. Press Stop on the box or phone to return the system to idle state. 
+
 ## Wobble alarm flow
 
 1. **Idle**: master continuously samples the IMU.
@@ -151,11 +167,7 @@ constants are at the top of `checkForWobble()` in
    vibration cannot immediately re-trigger the alarm. After cooldown, the
    system returns to idle.
 
-## Demo
 
-A demonstration video and presentation photos are included in the
-project's academic abstract submission (see the course Canvas page for
-ITI60020 Spring 2026).
 
 ## Course paper
 
