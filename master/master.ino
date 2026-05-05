@@ -251,6 +251,10 @@ class CmdCallback : public BLECharacteristicCallbacks {
         if (wobblePending) {
           wobblePending  = false;
           alarmStoppedAt = millis();      // start the cooldown
+          // Clear the warning triangle — alarm wasn't actually firing yet.
+          matrix.clear();
+          matrix.writeDisplay();
+          matrixState = false;
           Serial.println("Wobble cancelled by app during grace period");
         }
         setAlarm(false, "app stop");
@@ -350,7 +354,7 @@ void setAlarm(bool on, const char *reason) {
   alarmActive = on;
 
   if (on) {
-    tone(speakerPin, 100);              // siren tone — change frequency for a different pitch
+    tone(speakerPin, 1200);             // siren tone — change frequency for a different pitch
     lastBlinkTime = millis();           // reset the blink timer so the matrix starts ON immediately
   } else {
     noTone(speakerPin);                 // stop the PWM
@@ -603,6 +607,10 @@ void loop() {
     if (wobblePending) {
       wobblePending  = false;
       alarmStoppedAt = millis();
+      // Clear the warning triangle — alarm wasn't actually firing yet.
+      matrix.clear();
+      matrix.writeDisplay();
+      matrixState = false;
       Serial.println("Wobble cancelled by OFF button during grace period");
     }
     setAlarm(false, "local button");
@@ -627,6 +635,12 @@ void loop() {
     publishWobble();                              // tell the phone NOW so the emergency screen pops with the countdown
     wobblePending      = true;
     wobblePendingUntil = millis() + WOBBLE_GRACE_MS;
+    // Light the warning triangle immediately — it'll keep blinking through
+    // the grace period (and into the alarm if not cancelled). Gives a
+    // pocketed-phone rider a peripheral visual cue + time to hit OFF.
+    matrixState   = true;
+    lastBlinkTime = millis();
+    drawTriangle();
     Serial.printf("Wobble detected — arming in %lu ms\n", WOBBLE_GRACE_MS);
   }
 
@@ -659,8 +673,10 @@ void loop() {
   }
 
   // ---- (e) hazard-triangle blink ----
-  // While the alarm is active, toggle the matrix every blinkInterval ms.
-  if (alarmActive) {
+  // Blink during BOTH the wobble grace period and the active alarm. That
+  // way the rider sees the warning triangle as soon as the countdown
+  // begins, not only after the siren fires.
+  if (alarmActive || wobblePending) {
     if (now - lastBlinkTime >= (unsigned long)blinkInterval) {
       lastBlinkTime = now;
       matrixState   = !matrixState;
